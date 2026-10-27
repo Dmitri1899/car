@@ -116,7 +116,7 @@ specifications에는 아래 선택 목록의 각 항목을 한 번씩만 넣어�
 """
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=[prompt, image_part],
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
