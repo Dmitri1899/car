@@ -1,275 +1,449 @@
-import io
+import streamlit as st
+import requests
 import json
 import re
-from urllib.parse import urlparse
-
-import streamlit as st
+import base64
+from io import BytesIO
+from ddgs import DDGS
+from openai import OpenAI
 from PIL import Image
-from google import genai
-from google.genai import types
 
 st.set_page_config(
-    page_title="자동차 렌즈 | 사진으로 차 찾기",
-    page_icon="🚘",
-    layout="wide",
+    page_title="AI 자동차 제원 검색",
+    page_icon="🚗",
+    layout="wide"
 )
 
-st.markdown("""
-<style>
-    .block-container {max-width: 1150px; padding-top: 2rem; padding-bottom: 3rem;}
-    .hero {padding: 1.3rem 1.5rem; border-radius: 18px; background: linear-gradient(120deg,#101827,#263c59); color: white; margin-bottom: 1.2rem;}
-    .hero h1 {color:white; margin-bottom:.25rem;}
-    .muted {color:#667085; font-size:.92rem;}
-    div[data-testid="stMetric"] {border:1px solid #e6eaf0; padding:14px; border-radius:12px;}
-</style>
-""", unsafe_allow_html=True)
+st.title("🚗 AI 자동차 제원 검색")
+st.caption("자동차 사진을 올리고 모델과 세부 제원을 확인하세요.")
 
-CATEGORIES = {
-    "제작 연도": "출시 연도 및 해당 차량의 모델 연식",
-    "최고 속도": "최고 속도(km/h)",
-    "변속기 종류": "변속기 유형과 단수(예: 8단 자동, 6단 수동, CVT)",
-    "무게": "공차중량(kg), 가능하면 트림별 범위",
-    "폭": "전폭(mm), 사이드미러 포함 여부를 구분",
-    "길이": "전장(mm)",
-    "인승": "좌석 수/탑승 인원",
-    "자동차 형식": "차체 유형(세단, 해치백, SUV, 쿠페, 왜건 등)",
-    "가격": "출시 당시 또는 현재 신차 가격, 통화와 국가 및 기준 연도 명시",
-    "연비": "연비(km/L) 또는 전기차 전비(kWh/100km 또는 km/kWh), 측정 기준 명시",
-    "연료": "가솔린, 경유, 전기, 하이브리드, 플러그인 하이브리드, LPG 등",
-}
+# --------------------------------------------------
+# 제원 항목
+# --------------------------------------------------
+SPEC_OPTIONS = [
+    "연식",
+    "최고 속도",
+    "변속기",
+    "공차 중량",
+    "전폭",
+    "전장",
+    "전고",
+    "좌석 수",
+    "차체 형태",
+    "가격",
+    "연비",
+    "연료",
+    "마력",
+    "최고 출력",
+    "배기량",
+    "0-100km/h 가속 시간",
+    "엔진 종류",
+    "엔진명",
+    "구동 방식",
+    "최대 토크",
+]
 
-DEFAULT_CATEGORIES = ["제작 연도", "최고 속도", "변속기 종류", "무게", "폭", "길이", "인승", "자동차 형식", "가격", "연비", "연료"]
+DEFAULT_SPECS = [
+    "연식",
+    "최고 속도",
+    "변속기",
+    "공차 중량",
+    "전장",
+    "연료",
+    "마력",
+    "구동 방식",
+    "가격",
+]
 
-if "selected_categories" not in st.session_state:
-    st.session_state.selected_categories = DEFAULT_CATEGORIES.copy()
+# --------------------------------------------------
+# 세션 상태
+# --------------------------------------------------
+if "selected_specs" not in st.session_state:
+    st.session_state.selected_specs = DEFAULT_SPECS.copy()
+
 if "car_result" not in st.session_state:
     st.session_state.car_result = None
-if "last_upload_signature" not in st.session_state:
-    st.session_state.last_upload_signature = None
 
-def get_api_key():
-    try:
-        return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        return ""
+if "search_results" not in st.session_state:
+    st.session_state.search_results = []
 
-def strip_code_fences(text):
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text
-
-def extract_json(text):
-    text = strip_code_fences(text)
-    try:
-        return json.loads(text)
-    except Exception:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
-        raise ValueError("AI 응답에서 JSON을 읽지 못했습니다.")
-
-def host_of(url):
-    try:
-        return urlparse(url).netloc.replace("www.", "")
-    except Exception:
-        return ""
-
-def identify_car_and_research(image_bytes, mime_type, categories, api_key):
-    client = genai.Client(api_key=api_key)
-    category_instructions = "\n".join(
-        f'- "{name}": {CATEGORIES[name]}' for name in categories
-    )
-    prompt = f"""
-당신은 자동차 사진 식별 및 웹 조사 도우미다. 첨부 사진 속 차량을 가능한 한 정확히 식별하고 Google Search로 확인하라.
-사진만으로 세부 트림이나 연식을 확정할 수 없으면 추정이라고 분명히 표시하고, 확인할 수 없는 값은 "확인 불가"로 둔다.
-브랜드 국가(country)는 브랜드 본사가 시작된 국가를 한국어로 적는다.
-공식 모델명은 제조사가 사용하는 이름을 우선한다.
-공식 모델 사진은 제조사 공식 웹사이트의 모델 페이지나 미디어 페이지를 우선해서 찾는다. 공식 이미지의 직접 URL을 확실히 찾지 못하면 image_url은 빈 문자열로 둔다. 이미지 URL을 지어내지 말라.
-가격은 국가, 통화, 트림, 연식이 다르면 기준을 밝혀라. 제원은 가능하면 제조사 공식 자료를 우선하라.
-선택한 카테고리만 상세 조사하라. 나머지 카테고리 정보는 만들지 말라.
-
-사용자가 선택한 카테고리:
-{category_instructions}
-
-JSON 객체만 반환하라. 마크다운 코드 블록이나 JSON 바깥 설명은 쓰지 말라.
-반환 스키마:
-{{
-  "brand": "브랜드",
-  "brand_country": "브랜드 국가",
-  "official_model_name": "공식 모델명",
-  "model_year_or_generation": "확인된 연식/세대 또는 불확실성",
-  "confidence": "높음/보통/낮음",
-  "identification_note": "식별 근거와 사진만으로 구분하기 어려운 점",
-  "official_model_page": "제조사 공식 모델 페이지 URL 또는 빈 문자열",
-  "official_image_url": "공식 이미지 직접 URL 또는 빈 문자열",
-  "specifications": [
-    {{"category": "선택한 카테고리 이름", "value": "확인된 값과 단위", "basis": "연식/트림/시장/측정 기준 또는 불확실성", "source_title": "출처 제목", "source_url": "출처 URL"}}
-  ],
-  "sources": [
-    {{"title": "출처 제목", "url": "출처 URL", "why_relevant": "이 출처가 확인하는 내용"}}
-  ]
-}}
-specifications에는 아래 선택 목록의 각 항목을 한 번씩만 넣어라:
-{", ".join(categories)}
-가능한 경우 출처 URL을 각 제원 항목에 연결하라. 제조사 공식 자료와 신뢰도 높은 자동차 제원 자료를 우선하라.
-"""
-    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=[prompt, image_part],
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0.2,
-        ),
-    )
-    result = extract_json(response.text or "")
-    # Keep only requested categories, even if the model returns extras.
-    specs = result.get("specifications", [])
-    result["specifications"] = [
-        item for item in specs
-        if isinstance(item, dict) and item.get("category") in categories
-    ]
-    return result
-
-st.markdown("""
-<div class="hero">
-  <h1>🚘 자동차 렌즈</h1>
-  <div>사진 한 장으로 차종을 식별하고, 필요한 제원만 골라 확인하세요.</div>
-</div>
-""", unsafe_allow_html=True)
-
+# --------------------------------------------------
+# API 토큰
+# --------------------------------------------------
 with st.sidebar:
-    st.header("🔎 검색 설정")
-    st.caption("선택한 카테고리는 이 브라우저 세션의 다음 검색에도 유지됩니다.")
-    selected = st.multiselect(
-        "검색할 정보 카테고리",
-        options=list(CATEGORIES.keys()),
-        default=st.session_state.selected_categories,
-        help="여러 항목을 동시에 선택할 수 있어요.",
+    st.header("⚙️ AI 설정")
+    st.write("Hugging Face API 토큰을 입력하세요.")
+
+    hf_token = st.text_input(
+        "Hugging Face 토큰",
+        type="password",
+        help="토큰은 Hugging Face 계정에서 만들 수 있습니다."
     )
-    st.session_state.selected_categories = selected
+
+    st.caption(
+        "무료 이용에는 사용량 제한이 있을 수 있습니다. "
+        "토큰을 다른 사람에게 공개하지 마세요."
+    )
+
     st.divider()
-    st.markdown("**검색할 수 있는 정보**")
-    for name in CATEGORIES:
-        st.caption(f"• {name}")
-
-left, right = st.columns([1, 1.15], gap="large")
-with left:
-    st.subheader("1. 자동차 사진 업로드")
-    uploaded = st.file_uploader(
-        "자동차가 잘 보이는 사진을 선택하세요.",
-        type=["jpg", "jpeg", "png", "webp"],
-        help="차량 앞면 또는 뒷면의 로고와 디자인이 선명하면 식별에 도움이 됩니다.",
+    st.markdown(
+        "[Hugging Face 토큰 발급](https://huggingface.co/settings/tokens)"
     )
-    if uploaded:
-        raw_bytes = uploaded.getvalue()
-        try:
-            image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-            st.image(image, caption="업로드한 사진", use_container_width=True)
-        except Exception:
-            st.error("이미지를 읽을 수 없습니다. JPG 또는 PNG 파일을 사용해 주세요.")
-            raw_bytes = None
-    else:
-        raw_bytes = None
-        st.info("사진을 업로드하면 분석을 시작할 수 있습니다.")
 
-    run_search = st.button("🔍 자동차 식별 및 정보 검색", type="primary", use_container_width=True)
+# --------------------------------------------------
+# 사진 업로드와 제원 선택
+# --------------------------------------------------
+left, right = st.columns([1, 1])
+
+with left:
+    st.subheader("📷 자동차 사진")
+    uploaded_file = st.file_uploader(
+        "자동차 사진을 업로드하세요.",
+        type=["jpg", "jpeg", "png", "webp"]
+    )
+
+    if uploaded_file:
+        image = Image.open(uploaded_file).convert("RGB")
+        st.image(image, caption="업로드한 자동차", use_container_width=True)
 
 with right:
-    st.subheader("2. 검색 결과")
-    if run_search:
-        if not raw_bytes:
-            st.warning("먼저 자동차 사진을 업로드해 주세요.")
-        elif not selected:
-            st.warning("검색할 카테고리를 하나 이상 선택해 주세요.")
-        else:
-            api_key = get_api_key()
-            if not api_key:
-                st.error("Gemini API 키가 설정되지 않았습니다. 아래 배포 안내의 Secrets 설정을 먼저 완료해 주세요.")
-            else:
-                mime_type = uploaded.type or "image/jpeg"
-                with st.spinner("사진을 분석하고 웹에서 정보를 확인하고 있습니다..."):
-                    try:
-                        st.session_state.car_result = identify_car_and_research(
-                            raw_bytes, mime_type, selected, api_key
-                        )
-                        st.session_state.last_upload_signature = uploaded.name
-                    except Exception as exc:
-                        st.error(f"검색 중 문제가 발생했습니다: {exc}")
-                        st.caption("API 키, 인터넷 연결, API 사용량 한도를 확인해 주세요.")
+    st.subheader("📋 표시할 제원")
 
-    result = st.session_state.car_result
-    if result:
-        brand = result.get("brand", "확인 불가")
-        model = result.get("official_model_name", "확인 불가")
-        country = result.get("brand_country", "확인 불가")
-        st.markdown(f"### {brand} {model}")
-        c1, c2 = st.columns(2)
-        c1.metric("브랜드", brand or "확인 불가")
-        c2.metric("브랜드 국가", country or "확인 불가")
-        st.write(f"**공식 모델명:** {model or '확인 불가'}")
-        st.write(f"**식별 신뢰도:** {result.get('confidence', '미표시')}")
-        if result.get("model_year_or_generation"):
-            st.write(f"**연식/세대 참고:** {result['model_year_or_generation']}")
-        if result.get("identification_note"):
-            st.info(result["identification_note"])
+    selected_specs = st.multiselect(
+        "확인할 항목을 선택하세요.",
+        options=SPEC_OPTIONS,
+        default=st.session_state.selected_specs,
+        key="spec_selector"
+    )
 
-        official_image = result.get("official_image_url", "")
-        official_page = result.get("official_model_page", "")
-        if official_image:
-            st.image(official_image, caption="검색된 공식 모델 이미지", use_container_width=True)
-        elif official_page:
-            st.info("공식 모델 사진의 직접 주소를 확인하지 못했습니다. 제조사 공식 모델 페이지에서 사진을 확인해 주세요.")
-        if official_page:
-            st.link_button("제조사 공식 모델 페이지 열기", official_page)
+    st.session_state.selected_specs = selected_specs
 
-        st.markdown("#### 선택한 카테고리의 정보")
-        specs = result.get("specifications", [])
-        if specs:
-            for spec in specs:
-                with st.container(border=True):
-                    st.markdown(f"**{spec.get('category', '항목')}**")
-                    st.write(spec.get("value", "확인 불가"))
-                    if spec.get("basis"):
-                        st.caption(spec["basis"])
-                    if spec.get("source_url"):
-                        st.markdown(f"출처: [{spec.get('source_title') or host_of(spec['source_url'])}]({spec['source_url']})")
-        else:
-            st.warning("선택한 항목의 확인 가능한 정보가 반환되지 않았습니다. 다른 카테고리를 선택하거나 사진을 바꿔 다시 검색해 보세요.")
+    st.info(
+        "엔진, 변속기, 구동 방식 등이 다른 세부 모델은 "
+        "가능한 경우 각각 구분해서 표시합니다."
+    )
 
-        sources = result.get("sources", [])
-        if sources:
-            with st.expander("전체 검색 출처 보기"):
-                for source in sources:
-                    url = source.get("url", "")
-                    if url:
-                        st.markdown(f"- [{source.get('title') or host_of(url)}]({url})")
-                        if source.get("why_relevant"):
-                            st.caption(source["why_relevant"])
+analyze_button = st.button(
+    "🔍 자동차 분석 및 제원 검색",
+    type="primary",
+    use_container_width=True
+)
 
-        st.caption("참고: 사진만으로 정확한 연식·트림을 확정하기 어려울 수 있습니다. 중요한 구매·정비 결정 전에는 제조사 자료로 다시 확인하세요.")
+# --------------------------------------------------
+# 검색 기능
+# --------------------------------------------------
+def search_car_information(query, max_results=6):
+    """웹 검색 결과의 제목, 링크, 요약을 수집한다."""
+    results = []
+
+    try:
+        with DDGS() as ddgs:
+            items = ddgs.text(
+                query,
+                max_results=max_results
+            )
+
+            for item in items:
+                results.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("href", ""),
+                    "snippet": item.get("body", "")
+                })
+
+    except Exception as exc:
+        st.warning(f"웹 검색 중 문제가 발생했습니다: {exc}")
+
+    return results
+
+
+# --------------------------------------------------
+# AI 분석 기능
+# --------------------------------------------------
+def analyze_car(image, token, specs, search_results):
+    """이미지와 웹 검색 결과를 이용해 자동차 정보를 분석한다."""
+
+    client = OpenAI(
+        base_url="https://router.huggingface.co/v1",
+        api_key=token
+    )
+
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=90)
+
+    encoded_image = base64.b64encode(
+        buffer.getvalue()
+    ).decode("utf-8")
+
+    image_data_url = f"data:image/jpeg;base64,{encoded_image}"
+
+    search_text = json.dumps(
+        search_results,
+        ensure_ascii=False,
+        indent=2
+    )
+
+    prompt = f"""
+당신은 자동차 모델과 제원을 조사하는 도우미입니다.
+
+업로드된 자동차 사진과 아래 웹 검색 결과를 이용해 자동차를 식별하세요.
+
+[웹 검색 결과]
+{search_text}
+
+[요청 사항]
+1. 브랜드와 자동차의 공식 모델명을 식별합니다.
+2. 가능하면 제조 국가를 확인합니다.
+3. 사진만으로 정확한 세부 트림을 구분할 수 없다면 확정하지 않습니다.
+4. 세부 모델별로 엔진, 변속기, 구동 방식이 다르면 각각 구분합니다.
+5. 확인할 제원 항목은 다음과 같습니다.
+{json.dumps(specs, ensure_ascii=False)}
+6. 검색 결과로 확인되지 않은 값은 추측하지 말고 "확인 필요"라고 표시합니다.
+7. 가격은 국가, 연식, 트림에 따라 달라질 수 있으므로 기준을 설명합니다.
+8. 단위가 있는 수치는 단위를 함께 표시합니다.
+9. 출처 URL이 제공된 경우 해당 URL을 활용합니다.
+
+다음 JSON 형식으로만 답변하세요.
+
+{{
+  "brand": "브랜드",
+  "official_model_name": "공식 모델명",
+  "country": "제조사 본사 국가 또는 확인 가능한 국가",
+  "identification_confidence": "높음/보통/낮음",
+  "identification_notes": "식별 근거와 한계",
+  "variants": [
+    {{
+      "variant_name": "세부 모델 또는 트림명",
+      "specs": {{
+        "연식": "값 또는 확인 필요",
+        "최고 속도": "값 또는 확인 필요"
+      }},
+      "notes": "해당 세부 모델에 대한 설명",
+      "source_urls": []
+    }}
+  ],
+  "official_model_page": "공식 모델 페이지 URL 또는 빈 문자열",
+  "image_search_terms": "공식 이미지 검색에 사용할 검색어"
+}}
+
+주의:
+- variants에는 확인 가능한 세부 모델을 각각 넣으세요.
+- 제원은 실제 출처로 확인할 수 있는 경우에만 확정적으로 작성하세요.
+- 검색 결과가 부족하면 세부 모델을 임의로 만들어내지 마세요.
+- 출력은 유효한 JSON이어야 합니다.
+"""
+
+    response = client.chat.completions.create(
+        model="Qwen/Qwen2.5-VL-3B-Instruct",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_data_url
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=2500
+    )
+
+    return response.choices[0].message.content
+
+
+def extract_json(text):
+    """AI 응답에서 JSON 객체를 추출한다."""
+    text = text.strip()
+
+    text = re.sub(r"^```json\s*", "", text)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1:
+        raise ValueError("AI 응답에서 JSON 데이터를 찾을 수 없습니다.")
+
+    return json.loads(text[start:end + 1])
+
+
+# --------------------------------------------------
+# 분석 실행
+# --------------------------------------------------
+if analyze_button:
+    if not uploaded_file:
+        st.error("먼저 자동차 사진을 업로드하세요.")
+
+    elif not hf_token:
+        st.error("왼쪽 설정에서 Hugging Face 토큰을 입력하세요.")
+
+    elif not selected_specs:
+        st.error("확인할 제원 항목을 하나 이상 선택하세요.")
+
     else:
-        st.markdown("""
-        <div style="padding:1.5rem;border:1px dashed #cbd5e1;border-radius:16px;color:#667085;">
-        검색을 실행하면 이곳에 공식 모델명, 브랜드 국가, 공식 모델 사진 및 선택한 제원이 표시됩니다.
-        </div>
-        """, unsafe_allow_html=True)
+        try:
+            with st.spinner("자동차 모델을 식별하는 중입니다..."):
+                image = Image.open(uploaded_file).convert("RGB")
 
-st.divider()
-with st.expander("⚙️ Streamlit Cloud 배포 방법"):
-    st.markdown("""
-1. GitHub 저장소에 `main.py`와 `requirements.txt`를 올립니다.
-2. [Google AI Studio](https://aistudio.google.com/)에서 Gemini API 키를 발급합니다.
-3. Streamlit Community Cloud에서 앱을 배포합니다.
-4. 앱의 **Settings → Secrets**에 아래 내용을 입력합니다.
+                # 사진에 대한 1차 식별을 위해 웹 검색 결과를 준비한다.
+                # 사진 속 모델명은 아직 모르므로 일반적인 자동차 식별
+                # 자료를 검색한 뒤, AI가 이미지와 함께 검토한다.
+                preliminary_results = search_car_information(
+                    "자동차 모델 식별 제조사 공식 차량 모델 제원"
+                )
 
-```toml
-GEMINI_API_KEY = "여기에_발급받은_API_키"
-```
+                raw_result = analyze_car(
+                    image,
+                    hf_token,
+                    selected_specs,
+                    preliminary_results
+                )
 
-5. 앱의 메인 파일 경로를 `main.py`로 지정합니다.
+                result = extract_json(raw_result)
 
-API 키를 코드에 직접 적거나 GitHub에 올리지 마세요. Gemini API의 사용량 및 요금 정책은 Google AI 공식 안내를 확인하세요.
-""")
-st.caption("이 앱은 Gemini의 이미지 분석과 Google 검색 기반 답변을 사용합니다. 검색 결과 및 이미지 URL이 항상 제공되거나 완벽히 정확한 것은 아닙니다.")
+            # 식별된 모델명으로 추가 검색
+            model_name = result.get(
+                "official_model_name",
+                ""
+            )
+
+            brand = result.get("brand", "")
+
+            if model_name:
+                with st.spinner("모델별 제원과 공식 자료를 검색하는 중입니다..."):
+                    extra_results = search_car_information(
+                        f"{brand} {model_name} 공식 제원 엔진 트림"
+                    )
+
+                    result["web_search_results"] = extra_results
+
+            st.session_state.car_result = result
+            st.session_state.search_results = result.get(
+                "web_search_results",
+                []
+            )
+
+            st.success("분석이 완료되었습니다.")
+
+        except Exception as exc:
+            message = str(exc)
+
+            if "429" in message or "rate" in message.lower():
+                st.error(
+                    "AI 사용량 한도에 도달했거나 요청이 너무 많습니다. "
+                    "잠시 후 다시 시도하거나 Hugging Face 사용량을 확인하세요."
+                )
+            elif "401" in message or "403" in message:
+                st.error(
+                    "인증에 실패했습니다. Hugging Face 토큰과 권한을 확인하세요."
+                )
+            else:
+                st.error(f"분석 중 오류가 발생했습니다: {message}")
+
+
+# --------------------------------------------------
+# 결과 표시
+# --------------------------------------------------
+result = st.session_state.car_result
+
+if result:
+    st.divider()
+    st.header("🚘 분석 결과")
+
+    brand = result.get("brand", "확인 필요")
+    model_name = result.get(
+        "official_model_name",
+        "확인 필요"
+    )
+    country = result.get("country", "확인 필요")
+
+    info1, info2, info3 = st.columns(3)
+
+    info1.metric("브랜드", brand)
+    info2.metric("공식 모델명", model_name)
+    info3.metric("국가", country)
+
+    st.caption(
+        "식별 신뢰도: "
+        + str(result.get("identification_confidence", "확인 필요"))
+    )
+
+    notes = result.get("identification_notes", "")
+    if notes:
+        st.write(notes)
+
+    # 공식 모델 페이지
+    official_url = result.get("official_model_page", "")
+
+    if official_url.startswith("https://"):
+        st.markdown(f"**공식 모델 페이지:** {official_url}")
+
+    # 세부 모델별 제원
+    st.subheader("세부 모델별 제원")
+
+    variants = result.get("variants", [])
+
+    if not variants:
+        st.info("확인된 세부 모델 정보가 없습니다.")
+
+    for index, variant in enumerate(variants, start=1):
+        variant_name = variant.get(
+            "variant_name",
+            f"세부 모델 {index}"
+        )
+
+        with st.expander(variant_name, expanded=(index == 1)):
+            specs = variant.get("specs", {})
+
+            rows = []
+
+            for spec_name in st.session_state.selected_specs:
+                rows.append({
+                    "제원": spec_name,
+                    "값": specs.get(spec_name, "확인 필요")
+                })
+
+            if rows:
+                st.dataframe(
+                    rows,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+            variant_notes = variant.get("notes", "")
+            if variant_notes:
+                st.write(variant_notes)
+
+            urls = variant.get("source_urls", [])
+
+            if urls:
+                st.markdown("**관련 출처**")
+                for url in urls:
+                    if isinstance(url, str) and url.startswith("https://"):
+                        st.markdown(f"- {url}")
+
+    # 추가 웹 검색 결과
+    search_results = st.session_state.search_results
+
+    if search_results:
+        st.subheader("🔗 추가 검색 결과")
+
+        for item in search_results:
+            title = item.get("title", "검색 결과")
+            url = item.get("url", "")
+            snippet = item.get("snippet", "")
+
+            if url.startswith("https://"):
+                st.markdown(f"**[{title}]({url})**")
+            else:
+                st.write(title)
+
+            if snippet:
+                st.caption(snippet)
